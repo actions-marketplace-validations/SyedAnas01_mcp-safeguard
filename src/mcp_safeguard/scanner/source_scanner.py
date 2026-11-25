@@ -259,6 +259,16 @@ RULE_IDS: list[tuple[str, str]] = [
     ("SRC-034", "State-changing FastAPI/Flask route with no authentication dependency anywhere in the file"),
     ("SRC-035", "Secret-shaped constant falls back to a hardcoded non-empty string when its env var is unset"),
     ("SRC-036", "MCP SDK's DNS-rebinding protection explicitly disabled"),
+    ("SRC-037", "Dynamic code evaluation (eval/Function/vm/parse_expr) of a non-literal value"),
+    ("SRC-038", "Caller-controlled argv element passed to a flag-sensitive binary without a `--` separator"),
+    ("SRC-039", "Security check only enforced when a local/single-user/dev mode predicate is false"),
+    ("SRC-040", "Default administrator credentials hardcoded in source"),
+    ("SRC-041", "Inbound bearer token reused on an outbound call with no audience validation"),
+    ("SRC-042", "[experimental] Server-minted handle keys state with no caller ownership binding"),
+    ("SRC-043", "[experimental] Tool description/schema overwritten on refresh with no pinning or re-approval"),
+    ("SRC-044", "[experimental] requestState read with no integrity verification (HMAC/AEAD/verify)"),
+    ("SRC-045", "[experimental] cacheScope public with ttl>0 in a file that reads per-user/auth context"),
+    ("SRC-046", "OAuth proxy forwards to upstream authorize with static client_id + DCR and no per-client consent check"),
 ]
 
 
@@ -610,7 +620,7 @@ _AUTH_CHECK_PRESENT = re.compile(
 # loosening).
 _PATH_JOIN_WITH_ARG_INLINE = re.compile(
     r"(?:os\.path\.join\(|path\.join\(|Path\([^)\n]*\)\s*/\s*)"
-    r"(?:[^()\n]|\([^()\n]*\)){0,80}\b(?:args|params|kwargs|request|req)\b",
+    r"(?:[^()\n]|\([^()\n]*\)){0,80}(?<![\"'/.\w-])(?:(?:args|params|kwargs|request|req)\b|(?:arguments|tool_input|input)(?=\s*[.\[]))",
     re.IGNORECASE,
 )
 _ARG_DERIVED_ASSIGN = re.compile(
@@ -640,6 +650,80 @@ _PATH_CONTAINMENT_CHECK = re.compile(
 # class). Only excluded when the SAME call site also uses a known escaping
 # helper on the interpolated value, so a properly-quoted call doesn't fire.
 _SHELL_ESCAPED_INLINE = re.compile(r"shlex\.quote\(|shellQuote\(|escapeShellArg\(")
+
+# SRC-019 call-site discovery (0.10.1). The SRC-009 regex above missed
+# subprocess.check_output/check_call/Popen, os.popen, subprocess.getoutput
+# and child_process.execSync, and `[^)]*shell=True` broke on any nested paren
+# inside the argument list. SRC-019 now finds the call NAME, bounds the
+# call's own argument list with _matching_paren_end, and (for the subprocess
+# family) requires shell=True inside that argument list.
+_SHELL_CALL_NAME_BROAD = re.compile(
+    r"(?:child_process\.exec(?:Sync)?|(?<![.\w])exec(?:Sync)?|"
+    r"subprocess\.(?:run|call|check_call|check_output|Popen|getoutput|getstatusoutput)|"
+    r"os\.(?:system|popen))\s*\("
+)
+_SUBPROCESS_NEEDS_SHELL = re.compile(r"^subprocess\.(?:run|call|check_call|check_output|Popen)\b")
+_SHELL_TRUE_ARG = re.compile(r"\bshell\s*=\s*True\b")
+# A command string BUILT from pieces: template/f-string interpolation,
+# string concatenation, str.format, or %-formatting.
+_SHELL_BUILD_MARK = re.compile(
+    r"\$\{[^}]+\}|f[\"'][^\"']*\{[^}]+\}"
+    r"|[\"']\s*\+\s*[A-Za-z_$]|[A-Za-z_$\])]\s*\+\s*[\"'`]"
+    r"|[\"']\s*\.format\(|[\"']\s*%\s*[\w(]"
+)
+_FIRST_ARG_IDENT = re.compile(r"\(\s*([A-Za-z_$][\w$]*)\s*[,)]")
+_ENCLOSING_PARAMS = re.compile(
+    r"(?:\bdef\s+\w+\s*\(([^)]*)\)|\bfunction\b[^(]*\(([^)]*)\)|\(([^()]*)\)\s*=>)"
+)
+
+
+def _first_arg_is_enclosing_param(text: str, call_start: int, args: str) -> bool:
+    """True when the shell call's first argument is a bare identifier that is
+    also a parameter of the nearest enclosing function/def/arrow (within 1500
+    chars before the call) -- e.g. a tool handler `def run(cmd)` that does
+    `subprocess.run(cmd, shell=True)`: the caller supplies the whole command."""
+    m = _FIRST_ARG_IDENT.match(args)
+    if not m:
+        return False
+    ident = m.group(1)
+    before = text[max(0, call_start - 1500):call_start]
+    sigs = list(_ENCLOSING_PARAMS.finditer(before))
+    if not sigs:
+        return False
+    params = next(g for g in sigs[-1].groups() if g is not None)
+    return re.search(r"(?<![\w$])" + re.escape(ident) + r"(?![\w$])", params) is not None
+
+
+_CHILD_PROCESS_IMPORT = re.compile(
+    r"require\(\s*[\"'](?:node:)?child_process[\"']\s*\)|from\s+[\"'](?:node:)?child_process[\"']"
+)
+_LOCAL_EXEC_DEF = re.compile(
+    r"\bfunction\s+exec(?:Sync)?\s*\(|\b(?:var|let|const)\s+exec(?:Sync)?\s*=\s*(?:function\b|\()"
+)
+
+
+def _broad_shell_injection_site(text: str):
+    """First shell-executing call site whose command is built from pieces or
+    is a caller-supplied parameter, with no inline escaping helper. Returns
+    (start_index, call_text) or None."""
+    # A bare exec()/execSync() is only a shell call when it comes from
+    # child_process; Python's builtin exec and bundled helpers named exec
+    # (e.g. wrap-ansi) are not.
+    bare_exec_ok = bool(_CHILD_PROCESS_IMPORT.search(text)) and not _LOCAL_EXEC_DEF.search(text)
+    for m in _SHELL_CALL_NAME_BROAD.finditer(text):
+        if m.group(0).startswith("exec") and not bare_exec_ok:
+            continue
+        open_idx = m.end() - 1
+        end = _matching_paren_end(text, open_idx)
+        call = text[m.start():min(end, m.start() + 600)]
+        args = call[open_idx - m.start():]
+        if _SUBPROCESS_NEEDS_SHELL.match(call) and not _SHELL_TRUE_ARG.search(args):
+            continue
+        if _SHELL_ESCAPED_INLINE.search(call):
+            continue
+        if _SHELL_BUILD_MARK.search(args) or _first_arg_is_enclosing_param(text, m.start(), args):
+            return m.start(), call
+    return None
 
 # SRC-020: unencoded user input concatenated/interpolated directly into a URL
 # query string, instead of going through a proper encoder. This is the
@@ -698,9 +782,20 @@ _INBOUND_AUTH_CHECK = re.compile(
     # entrypoint file imports an OAuth provider class rather than reading a
     # header directly; an earlier version of this rule only recognized the
     # direct-header-read shape and missed this equally common one.
-    r"\w*(?:OAuth|Auth)Provider\b|\bauth\s*=\s*\w",
+    r"\w*(?:OAuth|Auth)Provider\b|\bauth\s*=\s*\w|"
+    # Bearer-token auth implemented in the file or via an imported auth
+    # manager (czlonkowski/n8n-mcp http-server.ts: AuthManager +
+    # AUTH_TOKEN + buildBearerChallenge, previously a false positive).
+    r"\bAuthManager\b|\bauthManager\b|\bAUTH_TOKEN\b|Bearer\s|BearerChallenge",
     re.IGNORECASE,
 )
+# Build-tool and bundler config files start dev/static servers that are not
+# the MCP server itself (apify build.js esbuild .serve(), vite configs).
+_BUILD_TOOL_FILE = re.compile(
+    r"(?:^|/)(?:build|(?:vite|webpack|rollup|esbuild)(?:\.[\w-]+)*\.config)\.[cm]?[jt]s$"
+)
+# A listen() call bound to a Unix-domain socket path, not a TCP port.
+_UNIX_SOCKET_LISTEN = re.compile(r"\.listen\(\s*\{[^}]{0,200}\bpath\s*:|\.listen\(\s*[\w.]*sock(?:et)?Path\b", re.IGNORECASE)
 # A thin entrypoint file (construct the server, delegate every tool/route
 # registration to another module via a single `register_tools(mcp)`-shaped
 # call, then serve) genuinely cannot be judged for auth from its own text --
@@ -1044,11 +1139,20 @@ _WS_SERVER_CTOR = re.compile(
     r"""\bws\.Server\(([^;\n]{0,150})|\bsocket\.io\(([^;\n]{0,150})"""
 )
 _PUBLIC_LITERAL_IN_CALL = re.compile(r"0\.0\.0\.0")
+_SERVER_START = re.compile(
+    r"\.listen\(|createServer\(|uvicorn\.run\(|\bapp\.run\(|\.run\([^)]*\bport\b|"
+    r"HTTPServer\(|TCPServer\(|serve_forever\(|\.serve\(|\bserve\(|"
+    r"WebSocketServer|ws\.Server|socket\.io\(|\.bind\(|ListenAndServe|"
+    r"TcpListener::bind|web\.run_app\(|start_server\(|websockets\.serve"
+)
 _ORIGIN_CHECK_PRESENT = re.compile(
     r"""req(?:uest)?\.headers(?:\.get)?\(?\s*\[?\s*["']origin["']|"""
     r"""headers\.get\(\s*["']origin["']|Context\.Headers\s*\[\s*["']Origin["']\s*\]|"""
     r"""\.origin\s*(?:==|!=|in\s|not\s+in\s)|checkOrigin\(|verifyOrigin\(|validate_origin\(|"""
-    r"""validateOrigin\(|allowed_origins|allowedOrigins|ALLOWED_ORIGINS""",
+    r"""validateOrigin\(|allowed_origins|allowedOrigins|ALLOWED_ORIGINS|"""
+    # Host-header allowlisting also defeats DNS rebinding (serena
+    # dashboard_api.py trusted_hosts).
+    r"""TrustedHostMiddleware|trusted_hosts|ALLOWED_HOSTS""",
     re.IGNORECASE,
 )
 _ORIGIN_REGEX_UNANCHORED = re.compile(
@@ -1294,7 +1398,15 @@ _SKIP_DIRS = {
     "node_modules", "dist", "vendor", ".git", "__pycache__", "test", "tests",
     "third_party", "thirdparty", ".yarn", "spec", "specs", "__tests__",
     "examples", "example", "demo", "demos", "sample", "samples", "spike", "spikes",
+    # Maintainer tooling and non-shipped code. On the top MCP servers these
+    # produced most of the HIGH findings, none of them reachable at runtime.
+    "scripts", "bench", "benchmark", "benchmarks", "e2e", "evals", "build",
+    "fixtures", "mocks", ".github",
 }
+
+# esbuild/rollup bundles inline node_modules with "// node_modules/<pkg>/..."
+# banners; their code duplicates src/ plus third-party helpers.
+_BUNDLE_MARKER = re.compile(r"^// node_modules/", re.M)
 
 
 def _iter_source(root: Path):
@@ -1317,6 +1429,8 @@ def _iter_source(root: Path):
         try:
             raw = p.read_text(encoding="utf-8", errors="ignore")
         except OSError:
+            continue
+        if len(_BUNDLE_MARKER.findall(raw, 0, 2_000_000)) >= 3:
             continue
         if lexical.classify_file_content(lexical.FileRole.PRODUCTION, raw) is not lexical.FileRole.PRODUCTION:
             continue
@@ -1385,6 +1499,272 @@ def _is_suppressed(lines: list[str], line_no: int, rule_id: str) -> bool:
         return False
     ids = {i.strip().upper() for i in m.group(1).split(",")}
     return "*" in ids or rule_id.upper() in ids
+
+
+# --- v27: generic shell-sink finder for SRC-019 ---------------------------
+# Mechanism fixes over the v26 single-regex check: (1) every sink in a file is
+# examined, not only the first; (2) the sink vocabulary covers the usual Node
+# (execSync/execAsync/promisified exec, spawn/execFile with shell:true,
+# shelljs), Python (os.system/popen, subprocess.* with shell=True, asyncio
+# create_subprocess_shell) and Go (exec.Command("sh","-c",...)) spellings;
+# (3) the command argument may be built inline OR assigned one hop earlier
+# from a template/concat/format expression.
+_V27_SINK = re.compile(
+    r"(?:\b(?:child_process|childProcess|cp|shell|shelljs|sh)\.exec(?:Sync|Async|Promise)?\(|"
+    r"(?<![\w.])exec(?:Sync|Async|Promise|P)?\s*\(|\.exec(?:Sync|Async)\s*\(|\bpromisify\(\s*exec\s*\)\s*\(|"
+    r"\bos\.(?:system|popen)\(|\basyncio\.create_subprocess_shell\(|"
+    r"\bsubprocess\.(?:run|call|Popen|check_output|check_call|getoutput|getstatusoutput)\(|"
+    r"\b(?:spawn|spawnSync|execFile|execFileSync|execa|execaSync)\(|"
+    r"\bexec\.Command(?:Context)?\()"
+)
+_V27_NEEDS_SHELL_FLAG = re.compile(r"subprocess\.(?!getoutput|getstatusoutput)|(?<![\w.])(?:spawn|spawnSync|execFile|execFileSync|execa|execaSync)\(")
+_V27_SHELL_FLAG = re.compile(r"shell\s*[:=]\s*(?:True|true|[\"'/][^,)}\s]*)|-c[\"']|/c[\"']|\bbash\b|\bsh\b")
+_V27_DYNAMIC = re.compile(
+    r"\$\{[^}]+\}|\bf[\"'][^\"'\n]*\{[^}]+\}|[\"'`]\s*\+\s*[A-Za-z_(]|[A-Za-z_)\]]\s*\+\s*[\"'`]|"
+    r"\.format\(|[\"']\s*%\s*[(\w]|\.join\(|\bf[\"']|\bfmt\.Sprintf\(|\bstrings\.Join\("
+)
+_V27_ESCAPE = re.compile(r"shlex\.(?:quote|join)\(|shellQuote\(|escapeShellArg\(|shell-quote|shellescape|quote\(")
+_V27_LEADING_IDENT = re.compile(r"\(\s*(?:await\s+)?([A-Za-z_]\w*)\s*[,)]")
+
+
+def _v27_call_args(text: str, open_idx: int, limit: int = 600) -> str:
+    depth, i, end = 0, open_idx, min(len(text), open_idx + limit)
+    while i < end:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:i + 1]
+        i += 1
+    return text[open_idx:end]
+
+
+def _v27_split_top_args(args: str) -> list[str]:
+    inner = args[1:-1] if args[:1] == "(" and args[-1:] == ")" else args[1:]
+    parts, depth, cur, quote = [], 0, [], ""
+    for c in inner:
+        if quote:
+            cur.append(c)
+            if c == quote:
+                quote = ""
+            continue
+        if c in "\"'`":
+            quote = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    parts.append("".join(cur))
+    return parts
+
+
+def _find_shell_injection_sites(text: str, suffix: str = "", max_sites: int = 20, require_import: bool = False) -> list[tuple[int, str]]:
+    sites: list[tuple[int, str]] = []
+    for m in _V27_SINK.finditer(text):
+        head = m.group(0)
+        if suffix == ".py" and re.match(r"exec\w*\s*\(", head):
+            continue  # Python builtin exec() is code evaluation (SRC-037), not a shell sink
+        if require_import and re.match(r"exec\s*\(", head) and not (
+            _CHILD_PROCESS_IMPORT.search(text) and not _LOCAL_EXEC_DEF.search(text)
+        ):
+            continue  # bare exec() is a shell call only when imported from child_process
+        open_idx = m.end() - 1
+        args = _v27_call_args(text, open_idx)
+        is_go = head.startswith("exec.Command")
+        if _V27_NEEDS_SHELL_FLAG.search(head) or is_go:
+            if not _V27_SHELL_FLAG.search(args):
+                continue
+        if _V27_ESCAPE.search(args):
+            continue
+        parts = _v27_split_top_args(args)
+        cmd_arg = parts[-1] if is_go else parts[0]
+        dynamic = bool(_V27_DYNAMIC.search(cmd_arg))
+        if not dynamic:
+            im = re.match(r"\s*(?:await\s+)?([A-Za-z_]\w*)\s*$", cmd_arg)
+            if im:
+                var = re.escape(im.group(1))
+                prior = text[max(0, m.start() - 1500):m.start()]
+                am = None
+                for am in re.finditer(rf"\b{var}\s*(?::\s*\w*\s*)?(\+?)=\s*([^\n;]*(?:\n[^\n;=]{{0,200}}){{0,3}})", prior):
+                    if am.group(1):  # `+=` appends a (presumably non-literal) piece
+                        break
+                if am and (am.group(1) or _V27_DYNAMIC.search(am.group(2))) and not _V27_ESCAPE.search(am.group(2)):
+                    dynamic = True
+        if dynamic:
+            sites.append((m.start(), text[m.start():m.start() + 90].strip()))
+            if len(sites) >= max_sites:
+                break
+    if not sites:
+        broad = _broad_shell_injection_site(text)  # caller-supplied parameter run through a shell
+        if broad:
+            sites.append((broad[0], broad[1][:90].strip()))
+    return sites
+
+
+# --- v28: SRC-039 enforcement gated on a deployment-mode flag ---------------
+# A security check (allowlist/verify/auth) that is only enforced when a
+# "local"/"single-user"/"dev" predicate is false silently disables the check
+# for that mode. The mode is deployer-chosen, but the code drops the guard.
+_V28_MODE = r"(?:local|single_?user|dev|debug|test|offline|standalone)"
+_V28_SEC = r"(?:allowlist|whitelist|allowed|verify|authoriz|authent|permission|sandbox|trusted)"
+_V28_GATE = re.compile(
+    r"(?:\b\w*enforce\w*\s*=\s*not\s+\w*" + _V28_MODE + r"\w*\s*\(|"
+    r"\bif\s+not\s+\w*" + _V28_MODE + r"\w*\s*\(\s*\)\s*:|"
+    r"\bif\s*\(\s*!\s*\w*" + _V28_MODE + r"\w*\s*\(\s*\)\s*\))",
+    re.IGNORECASE,
+)
+
+
+def _find_mode_gated_enforcement(text: str, max_sites: int = 10) -> list[tuple[int, str]]:
+    sites: list[tuple[int, str]] = []
+    lines = text.splitlines()
+    for m in _V28_GATE.finditer(text):
+        ln = text.count("\n", 0, m.start())
+        window = "\n".join(lines[max(0, ln - 1): ln + 6])
+        if re.search(_V28_SEC, window, re.IGNORECASE):
+            sites.append((m.start(), m.group(0)))
+            if len(sites) >= max_sites:
+                break
+    return sites
+
+
+# --- v28: SRC-040 default administrator credentials -------------------------
+_V28_DEFAULT_ADMIN = re.compile(
+    r"(?:\bcreate_superuser\([^)]*password\s*=\s*[\"'][^\"']{3,}[\"']|"
+    r"\b(?:DEFAULT_ADMIN_(?:PASSWORD|PASS|PWD)|ADMIN_DEFAULT_PASSWORD|DEFAULT_PASSWORD)\s*[:=]\s*[\"'][^\"'\s]{3,}[\"']|"
+    r"\bpassword\s*=\s*[\"'](?:admin|password|changeme|123456|admin123|root)[\"']\s*[,)\n])"
+)
+
+
+_V28_TEST_PATH = re.compile(
+    r"(?:^|/)(?:tests?|__tests__|spec|fixtures?|examples?)/|(?:^|/)test_|_test\.|\.test\.|\.spec\.|(?:^|/)tests\.py$"
+)
+
+
+def _find_default_admin_credentials(text: str, max_sites: int = 5) -> list[tuple[int, str]]:
+    sites: list[tuple[int, str]] = []
+    for m in _V28_DEFAULT_ADMIN.finditer(text):
+        sites.append((m.start(), m.group(0)[:90]))
+        if len(sites) >= max_sites:
+            break
+    return sites
+
+
+# --- v27: SRC-038 argument injection into flag-sensitive binaries ------------
+# argv-style exec (no shell) removes shell metacharacter injection but not
+# *option* injection: a caller-controlled element that starts with "-" is parsed
+# as a flag by git/ssh/curl/tar/npm/... (CWE-88). Fires only when the binary is
+# a literal from a flag-sensitive set, an argv element is non-literal, and no
+# "--" end-of-options marker precedes it.
+_V27_FLAG_BINS = r"git|ssh|scp|nmap|adb|npm|pnpm|yarn|npx|tar|curl|wget|rsync|docker|kubectl|ffmpeg|convert|7z|unzip|zip"
+_V27_ARGV_SINK = re.compile(
+    r"(?:\b(?:spawn|spawnSync|execFile|execFileSync|execa|execaSync)\(\s*[\"'`](?:" + _V27_FLAG_BINS + r")(?:\.exe)?[\"'`]\s*,\s*\[|"
+    r"\bsubprocess\.(?:run|call|Popen|check_output|check_call)\(\s*\[\s*[\"'](?:" + _V27_FLAG_BINS + r")[\"']\s*,|"
+    r"\bexec\.Command(?:Context)?\(\s*(?:\w+\s*,\s*)?\"(?:" + _V27_FLAG_BINS + r")\"\s*,)"
+)
+_V27_ARGV_LITERAL = re.compile(r"^\s*(?:[\"'`][^\"'`$\n{}]*[\"'`]|-?\d+(?:\.\d+)?|true|false|null|None|True|False)\s*$")
+_V27_ARGV_END = re.compile(r"[\"'`]--[\"'`]")
+
+
+def _find_argv_injection_sites(text: str, max_sites: int = 20) -> list[tuple[int, str]]:
+    sites: list[tuple[int, str]] = []
+    for m in _V27_ARGV_SINK.finditer(text):
+        tail = m.group(0)
+        if tail.rstrip().endswith("["):
+            open_idx = m.end() - 1  # the '[' of the argv array
+            args = _v27_call_args(text, open_idx)
+            elems = _v27_split_top_args("(" + args[1:-1] + ")")
+        elif "subprocess." in tail:
+            open_idx = text.index("[", m.start())
+            args = _v27_call_args(text, open_idx)
+            elems = _v27_split_top_args("(" + args[1:-1] + ")")[1:]  # drop the binary literal
+        else:  # Go: remaining call arguments after the binary
+            open_idx = text.index("(", m.start())
+            args = _v27_call_args(text, open_idx)
+            elems = _v27_split_top_args(args)
+            elems = elems[elems.index(next(e for e in elems if re.search(r'"(?:' + _V27_FLAG_BINS + r')"', e))) + 1:]
+        if _V27_ARGV_END.search(args):
+            continue
+        if _V27_ESCAPE.search(args):
+            continue
+        if any(not _V27_ARGV_LITERAL.match(e) for e in elems if e.strip()):
+            sites.append((m.start(), text[m.start():m.start() + 90].strip()))
+            if len(sites) >= max_sites:
+                break
+    return sites
+
+
+# --- v27: SRC-037 dynamic code evaluation of a non-literal -----------------
+# Generic CWE-94/95 sink list (language built-ins and the commonly misused
+# expression parsers); fires only when the argument is not a plain literal.
+_V27_EVAL_SINK = re.compile(
+    r"(?<![\w.])eval\s*\(|\b(?:window|globalThis|global|self|builtins)\.eval\s*\(|\(0,\s*eval\)\(|\bnew\s+Function\(|(?<![\w.])Function\(|\bvm\.(?:runIn\w+|Script)\(|\bnew\s+vm\.Script\(|"
+    r"\bsympify\(|\bparse_expr\(|\bsympy\.parsing\.\w+\.parse_expr\(|\bpickle\.loads?\(|"
+    r"(?<![\w.])exec\s*\("
+)
+_V27_EVAL_LITERAL_ARG = re.compile(r"\(\s*(?:r?[\"'][^\"'$\{\n]*[\"']|\d+|)\s*[,)]")
+
+
+def _find_dynamic_eval_sites(text: str, suffix: str, max_sites: int = 20) -> list[tuple[int, str]]:
+    sites: list[tuple[int, str]] = []
+    for m in _V27_EVAL_SINK.finditer(text):
+        head = m.group(0)
+        if head.startswith("exec(") and suffix != ".py":
+            continue
+        if ("pickle" in head or "sympify" in head or "parse_expr" in head) and suffix != ".py":
+            continue
+        if (head.startswith("eval(") or "Function" in head or "vm." in head) and suffix == ".py" and not head.startswith("eval("):
+            continue
+        args = _v27_call_args(text, text.index("(", m.start()), 300)
+        _bare = re.sub(r"\"[^\"\n$]*\"|'[^'\n$]*'|\b\d+\b", "", args[1:-1] if len(args) > 1 else "")
+        if "${" not in args and not re.search(r"[A-Za-z_$]", _bare):
+            continue  # every argument is a plain literal
+        if re.search(r"ast\.literal_eval|JSON\.parse", text[max(0, m.start() - 12):m.start()]):
+            continue
+        sites.append((m.start(), text[m.start():m.start() + 90].strip()))
+        if len(sites) >= max_sites:
+            break
+    return sites
+
+
+
+def _spec_detectors():
+    """Per-file detector callables (rel, text, suffix) -> list[SourceFinding]."""
+    from . import (
+        cache_scope_public,
+        mrtr_request_state,
+        oauth_confused_deputy,
+        state_handle_ownership,
+        token_passthrough,
+        tool_description_mutation,
+    )
+    from .ssrf_scanner import scan_source_for_metadata_ssrf
+
+    def _ssrf(rel: str, text: str, suffix: str) -> list[SourceFinding]:
+        return [
+            SourceFinding(
+                "SS-004", f.severity, f.title, f.description, f.location,
+                f.evidence, f.remediation, f.cvss_score,
+            )
+            for f in scan_source_for_metadata_ssrf(text, rel)
+        ]
+
+    return [
+        lambda r, t, s: oauth_confused_deputy.scan_text(r, t),
+        lambda r, t, s: token_passthrough.scan_text(r, t),
+        lambda r, t, s: state_handle_ownership.scan_text(r, t),
+        lambda r, t, s: tool_description_mutation.scan_text(r, t),
+        lambda r, t, s: mrtr_request_state.scan_text(r, t, s),
+        lambda r, t, s: cache_scope_public.scan_text(r, t),
+        _ssrf,
+    ]
 
 
 def scan_source_tree(root: str | Path) -> list[SourceFinding]:
@@ -1839,19 +2219,24 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
         # SRC-018: path joined with a request/argument-derived value, fed
         # into a file operation, with no containment check in between.
         # Try the inline shape first, then the assign-then-join shape.
-        pjm = _PATH_JOIN_WITH_ARG_INLINE.search(text)
-        src018_window = text[pjm.start():pjm.start() + 400] if pjm else None
-        if pjm is None:
-            for am in _ARG_DERIVED_ASSIGN.finditer(text):
-                var = am.group(1)
-                lookahead = text[am.end():am.end() + 400]
-                jm = _PATH_JOIN_CALL.search(lookahead)
-                if jm and re.search(rf"\b{re.escape(var)}\b", lookahead[jm.start():jm.end() + 120]):
-                    pjm = am  # anchor the reported location at the assignment
-                    src018_window = lookahead[jm.start():jm.end() + 300]
-                    break
-        if pjm and src018_window is not None:
-            if _FILE_OPEN_CALL.search(src018_window) and not _PATH_CONTAINMENT_CHECK.search(src018_window):
+        # v27: examine every candidate (inline-join shape, then assign-then-join
+        # shape), not only the first file-wide match; report each with no
+        # containment check in its own window.
+        _src018_hits: list[tuple[int, str]] = []
+        for pjm_i in _PATH_JOIN_WITH_ARG_INLINE.finditer(text):
+            w = text[max(0, pjm_i.start() - 60):pjm_i.start() + 400]  # sink may wrap the join call
+            if _FILE_OPEN_CALL.search(w) and not _PATH_CONTAINMENT_CHECK.search(w):
+                _src018_hits.append((pjm_i.start(), w))
+        for am in _ARG_DERIVED_ASSIGN.finditer(text):
+            var = am.group(1)
+            lookahead = text[am.end():am.end() + 400]
+            jm = _PATH_JOIN_CALL.search(lookahead)
+            if jm and re.search(rf"\b{re.escape(var)}\b", lookahead[jm.start():jm.end() + 120]):
+                w = lookahead[jm.start():jm.end() + 300]
+                if _FILE_OPEN_CALL.search(w) and not _PATH_CONTAINMENT_CHECK.search(w):
+                    _src018_hits.append((am.start(), w))
+        for _off, _w in sorted(set(_src018_hits))[:20]:
+            if True:
                 file_findings.append(SourceFinding(
                     "SRC-018", Severity.HIGH,
                     "Path traversal: joined path used with no containment check",
@@ -1865,8 +2250,8 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
                     "real path and checking it stays under the base "
                     "directory does. A value like '../../etc/passwd' or an "
                     "absolute path can escape the intended directory.",
-                    f"{rel}:{_line_of(text, pjm.start())}",
-                    text[pjm.start():pjm.start() + 90].strip(),
+                    f"{rel}:{_line_of(text, _off)}",
+                    text[_off:_off + 90].strip(),
                     "After joining, resolve the real path (os.path.realpath/"
                     "Path.resolve()) and verify it is still relative to the "
                     "base directory (Path.is_relative_to() or a commonpath "
@@ -1876,29 +2261,96 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
 
         # SRC-019: unescaped shell interpolation -- broader companion to
         # SRC-009, no repo-wide corroboration required (see module docstring).
-        sm2 = _SHELL_STRING_CALL.search(text)
-        if sm2:
-            window2 = text[sm2.start():sm2.start() + 200]
-            if _SHELL_INTERP_MARK.search(window2) and not _SHELL_ESCAPED_INLINE.search(window2):
+        for _site_off, _site_snip in _find_shell_injection_sites(text, path.suffix, require_import=True):
+            file_findings.append(SourceFinding(
+                "SRC-019", Severity.MEDIUM,
+                "Unescaped interpolation into a shell command (broad check)",
+                "A variable is interpolated into a shell command string "
+                "passed to exec/system (or to a spawn/subprocess/Command "
+                "call run through a shell), inline or via a command string "
+                "built one assignment earlier, with no escaping helper "
+                "(shlex.quote/shellQuote/escapeShellArg) applied at this "
+                "call site. Unlike SRC-009, this fires without requiring "
+                "evidence the repo already knows the risk elsewhere -- "
+                "broader recall, so treat this one as a lead to confirm "
+                "even more than the other source-audit rules: check "
+                "whether the interpolated value can ever be influenced "
+                "by a tool caller (directly or via prompt injection).",
+                f"{rel}:{_line_of(text, _site_off)}",
+                _site_snip,
+                "Use an argv-array exec (execFile/spawn with an args "
+                "list, or subprocess.run([...], shell=False)) or quote "
+                "the interpolated value with shlex.quote/shellQuote "
+                "before building the shell string.",
+                7.0,
+            ))
+
+        for _moff, _msnip in _find_mode_gated_enforcement(text):
+            file_findings.append(SourceFinding(
+                "SRC-039", Severity.MEDIUM,
+                "Security check enforced only outside a local/single-user/dev mode",
+                "An allowlist/verification/auth step is gated on a deployment-mode "
+                "predicate (local, single-user, dev, ...), so the check is silently "
+                "skipped in that mode. If that mode can be reached by a remote caller "
+                "(a documented flag, a default, a container or CI setup), the guard "
+                "does not apply. Treat as a lead: confirm how the mode is selected.",
+                f"{rel}:{_line_of(text, _moff)}",
+                _msnip,
+                "Enforce the check in every mode, or fail closed when the mode "
+                "predicate cannot be established as truly local.",
+                5.5,
+            ))
+
+        for _doff, _dsnip in ([] if _V28_TEST_PATH.search(rel) else _find_default_admin_credentials(text)):
+            file_findings.append(SourceFinding(
+                "SRC-040", Severity.MEDIUM,
+                "Default administrator credentials hardcoded in source",
+                "A fixed administrator password is created or defaulted in code. "
+                "Anyone who knows the project's defaults can authenticate as admin "
+                "on an instance whose operator did not change them.",
+                f"{rel}:{_line_of(text, _doff)}",
+                _dsnip,
+                "Generate a random password at first start or refuse to start "
+                "until one is configured.",
+                6.0,
+            ))
+
+        for _aoff, _asnip in _find_argv_injection_sites(text):
+            file_findings.append(SourceFinding(
+                "SRC-038", Severity.MEDIUM,
+                "Caller-controlled argv element passed to a flag-sensitive binary without `--`",
+                "An argv-style exec (no shell) runs a binary that parses leading "
+                "'-' arguments as options (git, ssh, curl, tar, npm, ...), and at "
+                "least one argv element is not a literal while no '--' end-of-options "
+                "marker precedes it. A caller-supplied value beginning with '-' is "
+                "then read as an option (CWE-88), e.g. git --upload-pack=<cmd>. "
+                "Treat as a lead: confirm the element is attacker-reachable.",
+                f"{rel}:{_line_of(text, _aoff)}",
+                _asnip,
+                "Insert '--' before caller-supplied positional arguments, reject "
+                "values starting with '-', and validate against an allowlist.",
+                6.0,
+            ))
+
+        if path.suffix in (".py", ".js", ".ts", ".mjs", ".cjs", ".tsx", ".jsx"):
+            for _eoff, _esnip in _find_dynamic_eval_sites(text, path.suffix):
                 file_findings.append(SourceFinding(
-                    "SRC-019", Severity.MEDIUM,
-                    "Unescaped interpolation into a shell command (broad check)",
-                    "A variable is interpolated into a shell command string "
-                    "passed to exec/system, with no escaping helper "
-                    "(shlex.quote/shellQuote/escapeShellArg) applied at this "
-                    "call site. Unlike SRC-009, this fires without requiring "
-                    "evidence the repo already knows the risk elsewhere -- "
-                    "broader recall, so treat this one as a lead to confirm "
-                    "even more than the other source-audit rules: check "
-                    "whether the interpolated value can ever be influenced "
-                    "by a tool caller (directly or via prompt injection).",
-                    f"{rel}:{_line_of(text, sm2.start())}",
-                    window2[:90].strip(),
-                    "Use an argv-array exec (execFile/spawn with an args "
-                    "list, or subprocess.run([...], shell=False)) or quote "
-                    "the interpolated value with shlex.quote/shellQuote "
-                    "before building the shell string.",
-                    7.0,
+                    "SRC-037", Severity.MEDIUM,
+                    "Dynamic code evaluation (eval/Function/vm/parse_expr) of a non-literal value",
+                    "A non-literal value is passed to a code-evaluation sink "
+                    "(eval, new Function, vm.run*, exec, sympy parse_expr/"
+                    "sympify, pickle.load). If any part of that value can be "
+                    "influenced by a tool caller, this is arbitrary code "
+                    "execution (CWE-94/95). Treat as a lead: confirm whether "
+                    "the value is attacker-reachable and whether a strict "
+                    "grammar/allowlist precedes it.",
+                    f"{rel}:{_line_of(text, _eoff)}",
+                    _esnip,
+                    "Replace with a purpose-built parser or a fixed-grammar "
+                    "evaluator (ast.literal_eval, JSON.parse, a math-expression "
+                    "library with no attribute access); never evaluate raw "
+                    "caller text.",
+                    6.5,
                 ))
 
         # SRC-020: unencoded value built directly into a URL query string --
@@ -1964,6 +2416,8 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
             and "stdio" not in nsm_context.lower()
             and file_is_judgeable
             and not _INBOUND_AUTH_CHECK.search(text)
+            and not _BUILD_TOOL_FILE.search(rel)
+            and not _UNIX_SOCKET_LISTEN.match(text, nsm.start())
         ):
             file_findings.append(SourceFinding(
                 "SRC-021", Severity.HIGH,
@@ -2132,6 +2586,22 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
                 cand_line_prefix = text[cand_line_start:cand.start()].lstrip()
                 if cand_line_prefix.startswith(("//", "#", "*")):
                     continue
+                call_args = text[text.find("(", cand.start()) + 1:cand.end() + 60]
+                # A typed parameter list is a function DEFINITION, not a
+                # call (apify-mcp-server client.ts: a custom
+                # `fetch(input: Request | URL | string, init?)` wrapper).
+                if re.match(r"\s*\w+\??\s*:\s*[A-Za-z]", call_args):
+                    continue
+                # The host is fixed when the URL starts from a constant or
+                # a base-URL getter and only the path varies (upstash/
+                # context7: fetch(`${CONTEXT7_API_BASE_URL}${PATH}`),
+                # fetch(`${getBaseUrl()}/api/...`)).
+                if re.match(
+                    r"\s*(?:f?[\"'`])?\s*(?:\$?\{\s*)?(?:[A-Z][A-Z0-9_]*\b(?!\s*\()|"
+                    r"get\w*(?:Base|Api)\w*Url\(\))",
+                    call_args,
+                ):
+                    continue
                 um = cand
                 break
             if um is not None:
@@ -2297,6 +2767,10 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
             bm = _RAW_BODY_LOGGED.search(window)
             if not bm or _REDACTION_APPLIED.search(window[:bm.end()]):
                 continue
+            # `err instanceof Error ? err.message : String(err)` logs the
+            # message; String(err) is only the non-Error fallback.
+            if re.search(r"\.message\s*:\s*$", window[:bm.start()]):
+                continue
             file_findings.append(SourceFinding(
                 "SRC-028", Severity.HIGH,
                 "Full upstream response/exception body logged with no redaction",
@@ -2334,12 +2808,32 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
             if not _STATIC_ENV_SOURCE.search(tm.group(2))
         ]
         if tok_matches:
-            wm = _PLAINTEXT_WRITE_CALL.search(text)
-            if wm and wm.start() > tok_matches[0].start():
+            tok_names = {tm.group(1) for tm in tok_matches}
+            wm = None
+            for cand in _PLAINTEXT_WRITE_CALL.finditer(text):
+                if cand.start() <= tok_matches[0].start():
+                    continue
+                stmt_end = text.find(";", cand.end())
+                stmt_nl = text.find("\n", cand.end())
+                ends = [e for e in (stmt_end, stmt_nl) if e != -1]
+                args = text[cand.start():min(ends) if ends else len(text)]
+                # The write must plausibly carry the secret: a token variable
+                # by name, or a token/credential/config-named target or
+                # payload (bank-mcp writes CONFIG_PATH, data).
+                # Previously fired on ANY later write in a file that merely
+                # mentioned a token (context-mode doctor-issue.ts,
+                # context7 toml-editor.ts/setup.ts), all false positives.
+                if any(n in args for n in tok_names) or re.search(
+                    r"token|secret|credential|config|auth", args, re.IGNORECASE
+                ):
+                    wm = cand
+                    break
+            if wm:
                 window = text[max(0, wm.start() - 150):wm.start() + 250]
+                restrictive_mode = re.search(r"mode\s*[:=]\s*(?:0o?600|384|\w*MODE\b)|chmod\w*\([^)]*0o?600", window)
                 if not _ENCRYPTION_CALL.search(window):
                     file_findings.append(SourceFinding(
-                        "SRC-029", Severity.HIGH,
+                        "SRC-029", Severity.MEDIUM if restrictive_mode else Severity.HIGH,
                         "Live access token/secret written to disk in plaintext",
                         "A token/secret variable (access_token, refresh_token, "
                         "session_token, api_secret, bank_token, or a generic "
@@ -2429,6 +2923,15 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
             # `#[cfg(test)]` attribute in the preceding ~500 chars -- real
             # production bind code has no reason to sit that close to one.
             preceding = text[max(0, lbm.start() - 800):lbm.start()]
+            # A loopback URL printed in a startup log line is not a bind
+            # (upstash/context7 index.ts: "running on HTTP at
+            # http://localhost:${port}/mcp" after app.listen(port), which
+            # binds every interface).
+            if "://" in statement and re.search(
+                r"(?:console|logger|log|logging)\.\w+\(\s*[`'\"]?[^)\n]*\n?[^)\n]*$",
+                preceding[-200:],
+            ):
+                continue
             if "://" in statement and re.search(
                 r"#\[\s*(?:tokio::)?test\s*\]|#\[cfg\(test\)\]|#\[rstest\]", preceding
             ):
@@ -2441,6 +2944,16 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
                 if not _PUBLIC_LITERAL_IN_CALL.search(call_args):
                     loopback_m = wsm
                     break
+        if (
+            loopback_m is not None
+            and loopback_m.re is _LOOPBACK_BIND
+            and (not _SERVER_START.search(text) or _BUILD_TOOL_FILE.search(rel))
+        ):
+            # A loopback host/URL in a file that never starts a listener is a
+            # client connecting out (chrome-devtools-mcp BrowserManager.ts
+            # ws://127.0.0.1 CDP connect, serena language-server clients),
+            # not a bind.
+            loopback_m = None
         if loopback_m and not _ORIGIN_CHECK_PRESENT.search(text):
             file_findings.append(SourceFinding(
                 "SRC-026", Severity.HIGH,
@@ -2685,6 +3198,9 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
                         "don't match.",
                         8.1,
                     ))
+                    # One finding per file: n8n-mcp reported the same
+                    # session-store pattern 5 times in one file.
+                    break
 
         # SRC-033: a caller-controlled simulate/dry_run boolean, defaulting
         # to the safe value, is the only thing gating a private-key
@@ -2834,6 +3350,14 @@ def scan_source_tree(root: str | Path) -> list[SourceFinding]:
         # it would otherwise be blanked out right along with every other
         # one before this check ever saw it.
         source_lines = raw_text.splitlines()
+        # v0.11: MCP-spec class detectors (confused deputy SRC-046, token
+        # passthrough SRC-041, state-handle ownership SRC-042, tool-description
+        # mutation SRC-043, MRTR requestState SRC-044, public cacheScope SRC-045)
+        # and SS-004 (unguarded fetch of client-supplied auth metadata). Imported
+        # lazily: these modules import SourceFinding from this one.
+        for _det in _spec_detectors():
+            file_findings.extend(_det(rel, text, path.suffix))
+
         for ff in file_findings:
             line_str = ff.location.rsplit(":", 1)[-1]
             line_no = int(line_str) if line_str.isdigit() else 0

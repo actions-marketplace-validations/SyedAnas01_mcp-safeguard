@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.syedanas01/mcp-safeguard",
-  "description": "Security scanner for MCP servers — automatically detect prompt injection, credential leaks, SSRF vulnerabilities, and tool poisoning, plus endpoint and dangerous-port probes.",
+  "name": "com.cognivators/mcp-safeguard",
+  "description": "Security scanner for MCP servers: prompt injection, credential leaks, SSRF, shell injection.",
   "repository": {
     "url": "https://github.com/SyedAnas01/mcp-safeguard",
     "source": "github"
   },
-  "version": "0.9.4",
+  "version": "0.11.0",
   "homepage": "https://cognivators.com",
   "license": "MIT",
   "author": {
@@ -32,7 +32,7 @@
     {
       "registryType": "pypi",
       "identifier": "mcp-safeguard",
-      "version": "0.9.4",
+      "version": "0.11.0",
       "transport": {
         "type": "stdio"
       },

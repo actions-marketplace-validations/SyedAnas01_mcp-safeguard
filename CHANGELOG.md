@@ -2,6 +2,83 @@
 
 All notable changes to mcp-safeguard are documented here.
 
+## [0.11.0] - 2026-11-24
+
+Merges the research line (v30 / RC2) into the released scanner and keeps the 0.10.2 precision work.
+
+### Added
+- **SRC-037** dynamic code evaluation of a non-literal (`eval`, `new Function`, `vm`, `parse_expr`, `sympify`, `pickle`, `exec`).
+- **SRC-038** caller-controlled argv element passed to a flag-sensitive binary (git, ssh, curl, tar, npm, ...) with no `--`.
+- **SRC-039** security check enforced only when a local/single-user/dev predicate is false.
+- **SRC-040** hardcoded default administrator credentials.
+- **SRC-041** inbound bearer token reused on an outbound call with no audience check (token passthrough).
+- **SRC-046** OAuth proxy with static client_id + DCR and no per-client consent check (confused deputy).
+- **SRC-042..045 (experimental, labelled in the title)**: server-minted handle with no ownership binding, tool description rewritten on refresh, MRTR `requestState` with no integrity check, public `cacheScope` on per-user data.
+- **SS-004** unguarded fetch of a client-supplied metadata, JWKS or discovery URL (CIMD, `jku`, `jwks_uri`). HIGH only when the name is caller-chosen by definition (`client_id`, `jku`, `x5u`, `jwks_uri`) or request input is visible in the file; operator constants, env/config reads and a bare `.well-known` path are ignored; `issuer`/`metadata_url` with no visible caller input are MEDIUM leads.
+- Deployment-profile stage and fix-line post-selection in the LLM tier; transitive 2-3 hop serverless entrypoint recovery for JS/TS; V4 hunter and adversary prompts.
+
+### Changed
+- **SRC-019** reports every shell sink in a file (Node `exec*`, `spawn`/`execFile` with a shell, Python `os.system`/`subprocess` with a shell, Go `sh -c`), follows a command string built one assignment earlier, and still flags a caller parameter run through a shell. A bare `exec()` still counts only when `child_process` is imported.
+- **SRC-018** reports every unguarded join site and recognizes `arguments` / `tool_input` names.
+
+### Measured (rule scanner only, deterministic, no LLM tier)
+- Development set `mcp_holdout_bench_v1` (49 targets with line anchors; not a sealed holdout): strict line-anchor recall 5/49 (0.10) on 0.10.2 to 14/49 (0.29) on 0.11.0.
+- HIGH findings on 12 popular MCP servers: 34 on 0.10.2, 34 on 0.11.0 (none added). MEDIUM leads rose from 11 to 35, mostly SRC-037 and SRC-019 on tools that execute code by design.
+- 1144 tests pass.
+
+## [0.10.2] - 2026-11-24
+
+### Changed
+
+Fewer false positives. Scanning six popular MCP servers (context7, chrome-devtools-mcp,
+context-mode, serena, n8n-mcp, apify-mcp-server) with 0.10.1 gave 86 HIGH findings, none of
+them real. 0.10.2 reports 13 on the same commits. Every exclusion below has a regression test,
+and the rules still fire on the vulnerable shapes they were built from.
+
+- `scan-source` skips `scripts/`, `bench*/`, `e2e/`, `evals/`, `build/`, `fixtures/`, `mocks/`
+  and `.github/`, and skips bundled JavaScript (files with several `// node_modules/` markers).
+- SRC-021 (listener with no auth): skips Unix-domain-socket listeners, build-tool and bundler
+  config files, and recognizes bearer-token auth (`AuthManager`, `AUTH_TOKEN`, `Bearer`).
+- SRC-026 (loopback server, no Origin check): only fires when the file actually starts a server.
+  A loopback URL used to connect out, or printed in a startup log line, is not a bind.
+  Host-header allowlists (`TrustedHostMiddleware`, `trusted_hosts`, `ALLOWED_HOSTS`) count as
+  DNS-rebinding protection.
+- SRC-023 (outbound fetch of a caller URL): skips fetch wrapper definitions and URLs that start
+  from a constant or a base-URL getter, where only the path varies.
+- SRC-028 (raw error body logged): skips `err instanceof Error ? err.message : String(err)`.
+- SRC-029 (token written in plaintext): the write must involve a token, credential or config
+  value, not any later write in the same file. Writes with mode `0o600` are MEDIUM.
+- SRC-032 (session id reuse): one finding per file instead of one per handler.
+
+## [0.10.1] - 2026-11-24
+
+### Fixed
+
+- Requires fastmcp>=4.2 and mcp>=2.0. Older versions made live-server scans fail with a TypeError in the MCP client timeout, returning no findings.
+- `--output` was ignored when `--format json` or `--format sarif` was set, for both `scan` and
+  `scan-source`. The report only went to stdout, so the documented CI recipe
+  (`--format sarif --output results.sarif`) and the GitHub Action never produced a SARIF file and
+  nothing reached code scanning. The file is now written, and the explicit `--format` wins over the
+  file extension.
+- SRC-019 (shell injection, broad check) now covers `subprocess.check_output` / `check_call` /
+  `Popen`, `os.popen`, `subprocess.getoutput`, and `child_process.execSync`; commands built by
+  concatenation, `str.format` or `%` formatting; and a tool parameter passed straight into a
+  shell call (`def run(cmd): subprocess.run(cmd, shell=True)`). The call's own argument list is now
+  bounded by paren matching instead of a fixed window, and every call site in a file is checked,
+  not just the first.
+- Credential scan: the by-name env check (CRED-018..028) now runs on each server's `env` inside
+  `mcpServers` (Claude Desktop) and `servers` (VS Code), not only a top-level `env`. CRED-016 now
+  matches current OpenAI key formats (`sk-proj-`, `sk-svcacct-`, `sk-admin-`).
+- Restored `resolve_pinned_ip()` and the pinned-IP connection path in `endpoint_scanner.py`. The
+  0.10.0 merge had dropped them, which reopened the DNS-rebinding TOCTOU fixed in 0.9.3 and made
+  `import mcp_safeguard.server` fail with an ImportError.
+- Release pipeline. The 0.9.5 and 0.9.6 GitHub releases never reached PyPI because `pyproject.toml`
+  still said 0.9.4 (PyPI rejected the upload as "File already exists"), and 0.10.0 failed its test
+  gate because CI did not install the tree-sitter grammars the new entrypoint tests import. CI and
+  the publish workflow now install those grammars, and the publish job refuses to run when the
+  release tag does not match the package version. 0.10.1 is the first release after 0.9.4 to reach
+  PyPI.
+
 ## [0.9.4] - 2026-10-19
 
 ### Changed
